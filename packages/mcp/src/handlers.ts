@@ -6,6 +6,7 @@ import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
 import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
+import { CLAUDE_CONTEXT_VERSION } from "./version.js";
 
 export class ToolHandlers {
     private context: Context;
@@ -1097,11 +1098,12 @@ export class ToolHandlers {
             const matchedPathInfo = statusCodebasePath !== absolutePath
                 ? `\nRequested path '${absolutePath}' is covered by tracked codebase '${statusCodebasePath}'.`
                 : '';
+            const versionInfo = `\n🏷️ claude-context version: ${CLAUDE_CONTEXT_VERSION}`;
 
             return {
                 content: [{
                     type: "text",
-                    text: statusMessage + pathInfo + matchedPathInfo
+                    text: statusMessage + pathInfo + matchedPathInfo + versionInfo
                 }]
             };
 
