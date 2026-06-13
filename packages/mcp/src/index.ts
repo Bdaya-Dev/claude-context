@@ -21,25 +21,31 @@ import {
     ListToolsRequestSchema,
     CallToolRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { Context } from "@zilliz/claude-context-core";
-import { MilvusVectorDatabase } from "@zilliz/claude-context-core";
-
-// Import our modular components
+// Import our modular components.
+// NOTE: anything that transitively imports @zilliz/claude-context-core (which
+// eagerly loads the heavy Milvus SDK — ~80s on a cold filesystem cache) is loaded
+// LAZILY in ensureInitialized() AFTER the stdio transport connects, so the MCP
+// `initialize` handshake never blocks (root cause of MCP error -32001). config.ts
+// and snapshot.ts are kept core-free so they remain safe to import statically.
 import { createMcpConfig, logConfigurationSummary, showHelpMessage, ContextMcpConfig } from "./config.js";
-import { createEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.js";
 import { SnapshotManager } from "./snapshot.js";
-import { SyncManager } from "./sync.js";
-import { ToolHandlers } from "./handlers.js";
+import type { Context } from "@zilliz/claude-context-core";
+import type { SyncManager } from "./sync.js";
+import type { ToolHandlers } from "./handlers.js";
 
 class ContextMcpServer {
     private server: Server;
-    private context: Context;
+    private config: ContextMcpConfig;
     private snapshotManager: SnapshotManager;
-    private syncManager: SyncManager;
-    private toolHandlers: ToolHandlers;
+    private context: Context | null = null;
+    private syncManager: SyncManager | null = null;
+    private toolHandlers: ToolHandlers | null = null;
+    private initPromise: Promise<void> | null = null;
 
     constructor(config: ContextMcpConfig) {
-        // Initialize MCP server
+        this.config = config;
+
+        // Initialize MCP server (lightweight — no core/Milvus imports here)
         this.server = new Server(
             {
                 name: config.name,
@@ -52,35 +58,60 @@ class ContextMcpServer {
             }
         );
 
-        // Initialize embedding provider
-        console.log(`[EMBEDDING] Initializing embedding provider: ${config.embeddingProvider}`);
-        console.log(`[EMBEDDING] Using model: ${config.embeddingModel}`);
-
-        const embedding = createEmbeddingInstance(config);
-        logEmbeddingProviderInfo(config, embedding);
-
-        // Initialize vector database
-        const vectorDatabase = new MilvusVectorDatabase({
-            address: config.milvusAddress,
-            ...(config.milvusToken && { token: config.milvusToken })
-        });
-
-        // Initialize Claude Context
-        this.context = new Context({
-            embedding,
-            vectorDatabase,
-            collectionNameOverride: config.collectionNameOverride
-        });
-
-        // Initialize managers
+        // SnapshotManager is core-free (JSON state only) — safe to load eagerly.
         this.snapshotManager = new SnapshotManager();
-        this.syncManager = new SyncManager(this.context, this.snapshotManager);
-        this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager);
-
-        // Load existing codebase snapshot on startup
         this.snapshotManager.loadCodebaseSnapshot();
 
         this.setupTools();
+    }
+
+    /**
+     * Lazily construct the heavy indexing engine (core Context + Milvus + embeddings
+     * + handlers) exactly once. Deferred until AFTER the stdio transport connects so
+     * the MCP `initialize` handshake is never blocked by the ~80s cold Milvus import
+     * (the cause of MCP error -32001). Idempotent: concurrent callers await the same
+     * promise; on failure the promise is reset so a later tool call can retry.
+     */
+    private ensureInitialized(): Promise<void> {
+        if (!this.initPromise) {
+            this.initPromise = (async () => {
+                const t0 = Date.now();
+                console.log('[INIT] Lazy-loading core indexing engine (Milvus / tree-sitter / embeddings)...');
+                const { Context, MilvusVectorDatabase } = await import("@zilliz/claude-context-core");
+                const { createEmbeddingInstance, logEmbeddingProviderInfo } = await import("./embedding.js");
+                const { SyncManager } = await import("./sync.js");
+                const { ToolHandlers } = await import("./handlers.js");
+
+                console.log(`[EMBEDDING] Initializing embedding provider: ${this.config.embeddingProvider} (model: ${this.config.embeddingModel})`);
+                const embedding = createEmbeddingInstance(this.config);
+                logEmbeddingProviderInfo(this.config, embedding);
+
+                const vectorDatabase = new MilvusVectorDatabase({
+                    address: this.config.milvusAddress,
+                    ...(this.config.milvusToken && { token: this.config.milvusToken })
+                });
+
+                this.context = new Context({
+                    embedding,
+                    vectorDatabase,
+                    collectionNameOverride: this.config.collectionNameOverride
+                });
+                this.syncManager = new SyncManager(this.context, this.snapshotManager);
+                this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager);
+
+                // One-shot legacy 0/0+completed snapshot healing (Issue #295) — now
+                // runs AFTER connect so it can't block the handshake.
+                await this.toolHandlers.validateLegacyZeroEntries();
+                // Periodic background sync.
+                this.syncManager.startBackgroundSync();
+                console.log(`[INIT] Core indexing engine ready in ${Date.now() - t0}ms`);
+            })().catch((err) => {
+                // Reset so a subsequent tool call can retry initialization.
+                this.initPromise = null;
+                throw err;
+            });
+        }
+        return this.initPromise;
     }
 
     private setupTools() {
@@ -230,15 +261,21 @@ This tool is versatile and can be used before completing various tasks to retrie
         this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
 
+            // Ensure the heavy core engine is loaded before serving any tool call.
+            // The first call may wait for the one-time lazy init (already warming in
+            // the background since the transport connected); subsequent calls are free.
+            await this.ensureInitialized();
+            const handlers = this.toolHandlers!;
+
             switch (name) {
                 case "index_codebase":
-                    return await this.toolHandlers.handleIndexCodebase(args);
+                    return await handlers.handleIndexCodebase(args);
                 case "search_code":
-                    return await this.toolHandlers.handleSearchCode(args);
+                    return await handlers.handleSearchCode(args);
                 case "clear_index":
-                    return await this.toolHandlers.handleClearIndex(args);
+                    return await handlers.handleClearIndex(args);
                 case "get_indexing_status":
-                    return await this.toolHandlers.handleGetIndexingStatus(args);
+                    return await handlers.handleGetIndexingStatus(args);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);
@@ -247,25 +284,25 @@ This tool is versatile and can be used before completing various tasks to retrie
     }
 
     async start() {
-        console.log('[SYNC-DEBUG] MCP server start() method called');
         console.log('Starting Context MCP server...');
 
-        // One-shot startup healing for legacy 0/0+completed snapshot entries
-        // left over from pre-fix MCP versions. Runs before the transport accepts
-        // requests so clients never observe the poisoning state. See Issue #295.
-        await this.toolHandlers.validateLegacyZeroEntries();
-
+        // Connect the stdio transport FIRST so the MCP `initialize` handshake
+        // completes immediately. ALL heavy work (core/Milvus import, embedding
+        // provider, legacy snapshot healing, background sync) is deferred to
+        // ensureInitialized() and runs AFTER connect — this fixes the MCP -32001
+        // startup timeout caused by the ~80s cold Milvus import blocking the handshake.
         const transport = new StdioServerTransport();
-        console.log('[SYNC-DEBUG] StdioServerTransport created, attempting server connection...');
-
         await this.server.connect(transport);
         console.log("MCP server started and listening on stdio.");
-        console.log('[SYNC-DEBUG] Server connection established successfully');
 
-        // Start background sync after server is connected
-        console.log('[SYNC-DEBUG] Initializing background sync...');
-        this.syncManager.startBackgroundSync();
-        console.log('[SYNC-DEBUG] MCP server initialization complete');
+        // IMPORTANT: do NOT eagerly warm the core engine here. Loading the Milvus
+        // SDK evaluates synchronously (Node module eval / require blocks the event
+        // loop ~7s warm, ~80s cold), which would stall the `initialize` RESPONSE even
+        // though the transport is already listening — re-introducing MCP -32001.
+        // The engine is loaded lazily on the FIRST tool call (CallTool → ensureInitialized),
+        // so the handshake and tools/list are always served instantly; the one-time
+        // load cost lands on the first index/search, which the user already expects
+        // to take time.
     }
 }
 
