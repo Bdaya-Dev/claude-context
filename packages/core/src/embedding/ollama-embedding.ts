@@ -54,6 +54,28 @@ export class OllamaEmbedding extends Embedding {
         }
     }
 
+    /**
+     * Call the Ollama embed API with bounded exponential-backoff retry, so a
+     * transient failure (Ollama busy, model still loading, momentary network blip)
+     * during a long-running index doesn't abort the whole run. After maxAttempts
+     * the last error propagates.
+     */
+    private async embedWithRetry(embedOptions: any, maxAttempts: number = 4): Promise<any> {
+        let lastError: any;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return await this.client.embed(embedOptions);
+            } catch (error: any) {
+                lastError = error;
+                if (attempt === maxAttempts) break;
+                const backoff = Math.min(1000 * 2 ** (attempt - 1), 8000) + Math.floor(Math.random() * 250);
+                console.warn(`[OllamaEmbedding] embed attempt ${attempt}/${maxAttempts} failed (${error?.message || error}); retrying in ${backoff}ms`);
+                await new Promise(resolve => setTimeout(resolve, backoff));
+            }
+        }
+        throw lastError;
+    }
+
     async embed(text: string): Promise<EmbeddingVector> {
         // Preprocess the text
         const processedText = this.preprocessText(text);
@@ -76,7 +98,7 @@ export class OllamaEmbedding extends Embedding {
             embedOptions.keep_alive = this.config.keepAlive;
         }
 
-        const response = await this.client.embed(embedOptions);
+        const response = await this.embedWithRetry(embedOptions);
 
         if (!response.embeddings || !response.embeddings[0]) {
             throw new Error('Ollama API returned invalid response');
@@ -111,7 +133,7 @@ export class OllamaEmbedding extends Embedding {
             embedOptions.keep_alive = this.config.keepAlive;
         }
 
-        const response = await this.client.embed(embedOptions);
+        const response = await this.embedWithRetry(embedOptions);
 
         if (!response.embeddings || !Array.isArray(response.embeddings)) {
             throw new Error('Ollama API returned invalid batch response');

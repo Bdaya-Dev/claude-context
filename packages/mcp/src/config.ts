@@ -1,4 +1,7 @@
-import { envManager } from "@zilliz/claude-context-core";
+// Deep import (NOT the package barrel) on purpose: the barrel eagerly loads the
+// heavy Milvus SDK (~80s cold import) which would block the MCP handshake. config
+// is needed before the transport connects, so it must stay core-free.
+import { envManager } from "@zilliz/claude-context-core/dist/utils/env-manager.js";
 
 export interface ContextMcpConfig {
     name: string;
