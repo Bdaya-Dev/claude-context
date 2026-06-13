@@ -37,6 +37,17 @@ export class ToolHandlers {
      * deletes real data and rewrites 0/0 — an infinite loop. See Issue #295.
      */
     private async queryCollectionStats(codebasePath: string): Promise<{ indexedFiles: number; totalChunks: number } | null> {
+        // Never "recover" a codebase the snapshot already records as indexfailed.
+        // An interrupted index leaves only a PARTIAL set of chunks in Milvus, so
+        // the row count is not a trustworthy "completed" total — recovering it
+        // would silently report a partial index (e.g. 36%) as fully indexed and
+        // hide the failure. Leave it failed so get_indexing_status surfaces it and
+        // the user re-indexes. (The legitimate completion path uses real indexer
+        // stats, not this helper, so it is unaffected.)
+        if (this.snapshotManager.getCodebaseStatus(codebasePath) === 'indexfailed') {
+            console.warn(`[SNAPSHOT-RECOVERY] '${codebasePath}' is marked indexfailed — refusing to recover a partial index as completed`);
+            return null;
+        }
         try {
             const collectionName = this.context.getCollectionName(codebasePath);
             const rowCount = await this.context.getVectorDatabase().getCollectionRowCount(collectionName);
