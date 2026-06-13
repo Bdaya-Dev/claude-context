@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { MerkleDAG } from './merkle';
 import * as os from 'os';
+import { isHiddenPathAllowed, isAlwaysIncludedFilename } from '../utils/file-filters';
 
 export class FileSynchronizer {
     private fileHashes: Map<string, string>;
@@ -84,7 +85,9 @@ export class FileSynchronizer {
                 // Verify it's really a file and not ignored
                 if (!this.shouldIgnore(relativePath)) {
                     const ext = path.extname(entry.name);
-                    if (this.supportedExtensions.length > 0 && !this.supportedExtensions.includes(ext)) {
+                    if (this.supportedExtensions.length > 0
+                        && !this.supportedExtensions.includes(ext)
+                        && !isAlwaysIncludedFilename(entry.name)) {
                         continue;
                     }
                     try {
@@ -102,9 +105,9 @@ export class FileSynchronizer {
     }
 
     private shouldIgnore(relativePath: string): boolean {
-        // Always ignore hidden files and directories (starting with .)
-        const pathParts = relativePath.split(path.sep);
-        if (pathParts.some(part => part.startsWith('.'))) {
+        // Ignore hidden files/dirs (leading dot) EXCEPT an explicit allow-list
+        // (.github/, .gitlab-ci.yml) so important CI config is still indexed.
+        if (!isHiddenPathAllowed(relativePath)) {
             return true;
         }
 

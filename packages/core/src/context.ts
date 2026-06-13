@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { FileSynchronizer } from './sync/synchronizer';
+import { isHiddenPathAllowed, isAlwaysIncludedFilename } from './utils/file-filters';
 
 /**
  * Thrown by indexCodebase / processFileList when an AbortSignal fires
@@ -826,8 +827,7 @@ export class Context {
                 if (entry.isDirectory()) {
                     await traverseDirectory(fullPath);
                 } else if (entry.isFile()) {
-                    const ext = path.extname(entry.name);
-                    if (supportedExtensions.includes(ext)) {
+                    if (supportedExtensions.includes(path.extname(entry.name)) || isAlwaysIncludedFilename(entry.name)) {
                         files.push(fullPath);
                     }
                 }
@@ -1291,11 +1291,10 @@ export class Context {
     private matchesIgnorePattern(filePath: string, basePath: string, ignorePatterns: string[] = this.ignorePatterns): boolean {
         const relativePath = path.relative(basePath, filePath);
 
-        // Always ignore dotfiles/dotdirs to stay aligned with
-        // FileSynchronizer.shouldIgnore. If these traversals diverge, files
-        // indexed here are never hashed by the synchronizer and their stale
-        // chunks linger in Milvus forever.
-        if (relativePath.split(path.sep).some(part => part.startsWith('.'))) {
+        // Ignore dotfiles/dotdirs (aligned with FileSynchronizer.shouldIgnore)
+        // EXCEPT an explicit allow-list (.github/, .gitlab-ci.yml) so CI config
+        // is indexed. Keeping both walkers aligned avoids stale Milvus chunks.
+        if (!isHiddenPathAllowed(relativePath)) {
             return true;
         }
 
