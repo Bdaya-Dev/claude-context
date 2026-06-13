@@ -645,7 +645,13 @@ export class SnapshotManager {
                 lastUpdated: new Date().toISOString()
             };
 
-            fs.writeFileSync(this.snapshotFilePath, JSON.stringify(snapshot, null, 2));
+            // Atomic write: serialize to a temp file in the same directory, then
+            // rename over the target. A crash mid-write can never leave a truncated/
+            // corrupt snapshot (rename is atomic on the same filesystem; on Windows
+            // libuv uses MoveFileEx with replace-existing).
+            const tmpPath = `${this.snapshotFilePath}.tmp.${process.pid}`;
+            fs.writeFileSync(tmpPath, JSON.stringify(snapshot, null, 2));
+            fs.renameSync(tmpPath, this.snapshotFilePath);
 
             // Clear recently removed set after successful save
             this.recentlyRemoved.clear();

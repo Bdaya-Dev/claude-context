@@ -65,9 +65,14 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
         case 'Ollama':
             const ollamaHost = config.ollamaHost || 'http://127.0.0.1:11434';
             console.log(`[EMBEDDING] 🔧 Configuring Ollama with model: ${config.embeddingModel}, host: ${ollamaHost}${config.ollamaDimension ? `, dimension: ${config.ollamaDimension}` : ''}`);
+            // Keep the embedding model resident to avoid Ollama's default 5-minute
+            // unload causing slow cold reloads mid-index. Override via OLLAMA_KEEP_ALIVE
+            // (e.g. "30m", or "0" to disable); default -1 = keep loaded indefinitely.
+            const ollamaKeepAlive: string | number = process.env.OLLAMA_KEEP_ALIVE ?? -1;
             const ollamaEmbedding = new OllamaEmbedding({
                 model: config.embeddingModel,
                 host: ollamaHost,
+                keepAlive: ollamaKeepAlive,
                 ...(config.ollamaDimension && { dimension: config.ollamaDimension })
             });
             console.log(`[EMBEDDING] ✅ Ollama embedding instance created successfully`);
